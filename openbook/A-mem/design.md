@@ -426,10 +426,60 @@ stateDiagram-v2
 
 ### 7.2 记忆整合机制
 
-当演化计数达到阈值时，系统执行 `consolidate_memories()`：
+> **核心问题**: "演进"并不增加记忆数量，而是修改已有记忆的元数据（links、tags、context）。`consolidate_memories()` 的设计意图是定期将这些元数据变更同步到 ChromaDB。
+
+#### 7.2.1 整合流程
+
+当演化计数 `evo_cnt` 达到 `evo_threshold` 的整数倍时，系统执行 `consolidate_memories()`：
+
 1. 创建全新的 `ChromaRetriever` 实例（清空旧索引）
-2. 遍历 `memories` 字典中所有记忆
+2. 遍历 `self.memories` 字典中所有记忆
 3. 重新将每条记忆及其最新元数据写入 ChromaDB
+
+#### 7.2.2 为什么需要整合？——双存储不一致问题
+
+系统采用双重存储架构（Python Dict + ChromaDB），但演进过程中两种动作对 ChromaDB 的同步行为不同：
+
+| 演进动作 | 修改内容 | 是否即时同步 ChromaDB |
+|----------|----------|----------------------|
+| `strengthen` | 修改**当前新记忆**的 `links` 和 `tags` | **是**（`add_note` 后续会 `add_document`） |
+| `update_neighbor` | 修改**邻居记忆**的 `context` 和 `tags` | **否**（仅修改 Python 对象） |
+
+`update_neighbor` 只修改了 `self.memories` 字典中的 Python 对象，**完全没有同步到 ChromaDB**。因此 `consolidate_memories()` 实际上是一个**延迟同步机制**——把积累的元数据变更批量刷到 ChromaDB：
+
+```mermaid
+flowchart LR
+    subgraph 多次演进后
+        M["self.memories (Python Dict)<br/>tags/context 已更新 ✓"]
+        C["ChromaDB<br/>tags/context 仍是旧值 ✗"]
+    end
+
+    M -->|consolidate_memories()| REBUILD["重建 ChromaDB<br/>从 memories 重新写入"]
+    REBUILD --> SYNC["双存储重新一致"]
+```
+
+#### 7.2.3 已知缺陷
+
+**缺陷 1: 窗口期数据不一致**
+
+在两次 consolidation 之间，ChromaDB 里的邻居记忆元数据是过时的。`search_agentic()` 从 ChromaDB 读取 metadata，返回的 `tags` 和 `context` 是旧值，而非 `update_neighbor` 更新后的新值。
+
+**缺陷 2: `update_neighbor` 索引定位错误**
+
+`update_neighbor` 使用 `list(self.memories.values())` 的序号索引去定位邻居记忆，但这个列表的遍历顺序与 ChromaDB 搜索返回的邻居顺序**没有对应关系**，因此可能更新**错误的记忆**。这意味着 consolidation 同步到 ChromaDB 的数据本身就可能是错的。
+
+```mermaid
+flowchart TD
+    SEARCH["ChromaDB 搜索返回邻居<br/>按语义相似度排序"] --> INDICES["indices = [2, 0, 4]<br/>ChromaDB 结果的序号"]
+    INDICES --> NOTESLIST["noteslist = list(memories.values())<br/>按字典插入顺序"]
+    NOTESLIST --> MISMATCH{"indices[i] 与 noteslist<br/>无对应关系!"}
+    MISMATCH -->|可能| WRONG["更新了错误的记忆"]
+    MISMATCH -->|偶然| RIGHT["碰巧更新正确"]
+```
+
+**缺陷 3: `retrieval_count` 和 `last_accessed` 未维护**
+
+`read()` 和 `search_agentic()` 方法在检索记忆时，没有更新 `retrieval_count` 和 `last_accessed` 字段，导致这些元数据始终为初始值，consolidation 也无法修复。
 
 ---
 
